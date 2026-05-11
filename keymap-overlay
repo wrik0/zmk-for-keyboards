@@ -263,7 +263,7 @@ def draw(stdscr, layers, cur):
             half_top(r_top, LEFT_C)
         else:
             half_sep(r_top, LEFT_C)
-        half_content(r_cont, LEFT_C, row_idx * 6)
+        half_content(r_cont, LEFT_C, row_idx * 12)
 
         # right half
         if row_idx == 0:
