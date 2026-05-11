@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+Corne keymap overlay — floating cheat-sheet for Sway.
+
+First-time setup (add to your sway config):
+    for_window [app_id="keymap-overlay"] floating enable, move position center
+    bindsym $mod+F1 exec /path/to/keymap-overlay
+
+Usage:
+    Run directly — will launch itself in a floating foot window if not in a terminal.
+    0-6 or h/l / ◀▶ to switch layers.  q or Esc to close.
+"""
+
+import curses
+import os
+import re
+import sys
+
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# If not already in a terminal (e.g. launched from Sway keybinding),
+# re-exec ourselves inside a floating foot window.
+if not sys.stdin.isatty():
+    script = os.path.realpath(__file__)
+    os.execvp("foot", ["foot", "--app-id=keymap-overlay", "-W", "96x18", script])
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+KEYMAP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "config", "corne.keymap")
+
+# ── Label tables ──────────────────────────────────────────────────────────────
+LAYER_SHORT = {
+    "BASE": "BASE", "NAV": "NAV ",  "NUM": "NUM ",
+    "MEDIA": "MED ", "SYM": "SYM ", "FUN": "FUN ", "MOUSE": "MSE ",
+}
+
+_KEYS = {
+    **{c: c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    **{f"N{i}": str(i) for i in range(10)},
+    **{f"KP_N{i}": f"K{i}" for i in range(10)},
+    "KP_PLUS": "K+",   "KP_MINUS": "K-",  "KP_MULTIPLY": "K*",
+    "KP_DIVIDE": "K/", "KP_DOT": "K.",    "KP_ENTER": "KENT",
+    "KP_NUMLOCK": "NMLK",
+    "TAB": "TAB",   "BSPC": "BSPC", "DEL": "DEL",   "RET": "RET",
+    "ESC": "ESC",   "SPACE": "SPC", "INS": "INS",    "CAPS": "CAPS",
+    "SEMI": ";",    "SQT": "'",     "COMMA": ",",    "DOT": ".",
+    "FSLH": "/",    "BSLH": "\\",  "GRAVE": "`",    "LBKT": "[",
+    "RBKT": "]",    "LBRC": "{",   "RBRC": "}",     "LPAR": "(",
+    "RPAR": ")",    "EQUAL": "=",  "MINUS": "-",    "PLUS": "+",
+    "ASTRK": "*",   "AMPS": "&",   "DLLR": "$",     "PRCNT": "%",
+    "CARET": "^",   "HASH": "#",   "AT": "@",       "EXCL": "!",
+    "TILDE": "~",   "PIPE": "|",   "COLON": ":",    "UNDER": "_",
+    "LT": "<",      "GT": ">",     "QMARK": "?",    "DQT": '"',
+    "LSHFT": "LSFT","RSHFT": "RSFT","LCTRL": "LCTL","RCTRL": "RCTL",
+    "LALT": "LALT", "RALT": "RALT","LGUI": "LGUI",  "RGUI": "RGUI",
+    "LEFT": "◀",    "RIGHT": "▶",  "UP": "▲",       "DOWN": "▼",
+    "HOME": "HOME", "END": "END",  "PG_UP": "PGUP", "PG_DN": "PGDN",
+    **{f"F{i}": f"F{i}" for i in range(1, 13)},
+    "PSCRN": "PRSC","SLCK": "SCLK","PAUSE_BREAK": "PAUS",
+    "C_PREV": "PREV","C_NEXT": "NEXT","C_PP": "PLAY","C_STOP": "STOP",
+    "C_VOL_UP": "VOL+","C_VOL_DN": "VOL-","C_MUTE": "MUTE",
+    "OUT_TOG": "OTOG",
+}
+_MOD = {
+    "LGUI": "⌘", "RGUI": "⌘", "LALT": "⌥", "RALT": "⌥",
+    "LCTRL": "^", "RCTRL": "^", "LSHFT": "⇧", "RSHFT": "⇧",
+    "LC": "^",   "LS": "⇧",   "LA": "⌥",    "LG": "⌘",
+    "RC": "^",   "RS": "⇧",   "RA": "⌥",    "RG": "⌘",
+}
+_BTN  = {"LCLK": "LC", "RCLK": "RC", "MCLK": "MC"}
+_MMV  = {"MOVE_LEFT": "M◀", "MOVE_RIGHT": "M▶", "MOVE_UP": "M▲", "MOVE_DOWN": "M▼"}
+_MSC  = {"SCRL_LEFT": "S◀", "SCRL_RIGHT": "S▶", "SCRL_UP": "S▲", "SCRL_DOWN": "S▼"}
+_RGB  = {"RGB_TOG": "RTOG", "RGB_EFF": "REFF", "RGB_HUI": "RHUE", "RGB_SAI": "RSAT"}
+
+
+def kl(code):
+    return _KEYS.get(code, code[:5])
+
+
+def label(token):
+    t = (token or "").strip()
+    if not t or t == "&none":   return ""
+    if t == "&trans":           return "▽"
+    if t == "&caps_word":       return "CAPW"
+    if t == "&sys_reset":       return "RST"
+    if t == "&bootloader":      return "BOOT"
+
+    m = re.match(r"&kp\s+(\S+)", t)
+    if m:
+        key = m.group(1)
+        # nested modifier wrappers: LC(LS(Z)) or LC(Z)
+        mk = re.match(r"([A-Z]+)\((.+)\)", key)
+        if mk:
+            outer, inner = mk.group(1), mk.group(2)
+            mk2 = re.match(r"([A-Z]+)\((\w+)\)", inner)
+            if mk2:
+                return _MOD.get(outer, "") + _MOD.get(mk2.group(1), "") + kl(mk2.group(2))
+            return _MOD.get(outer, outer[:1]) + kl(inner)
+        return kl(key)
+
+    m = re.match(r"&mt\s+(\S+)\s+(\S+)", t)
+    if m:
+        return kl(m.group(2)) + _MOD.get(m.group(1), m.group(1)[:1])
+
+    m = re.match(r"&lt\s+(\S+)\s+(\S+)", t)
+    if m:
+        return kl(m.group(2)) + "[" + LAYER_SHORT.get(m.group(1), m.group(1)[:3]).strip() + "]"
+
+    m = re.match(r"&mkp\s+(\S+)",   t);  _r = m and _BTN.get(m.group(1), m.group(1)[:4])
+    if _r: return _r
+    m = re.match(r"&mmv\s+(\S+)",   t);  _r = m and _MMV.get(m.group(1), m.group(1)[:4])
+    if _r: return _r
+    m = re.match(r"&msc\s+(\S+)",   t);  _r = m and _MSC.get(m.group(1), m.group(1)[:4])
+    if _r: return _r
+    m = re.match(r"&rgb_ug\s+(\S+)",t);  _r = m and _RGB.get(m.group(1), m.group(1)[:4])
+    if _r: return _r
+    m = re.match(r"&bt\s+BT_SEL\s+(\d)", t)
+    if m:  return f"BT{m.group(1)}"
+    m = re.match(r"&bt\s+(\S+)", t)
+    if m:  return {"BT_CLR": "BCLR"}.get(m.group(1), m.group(1)[:4])
+    m = re.match(r"&out\s+(\S+)", t)
+    if m:  return {"OUT_TOG": "OTOG"}.get(m.group(1), m.group(1)[:4])
+
+    return t.lstrip("&")[:5]
+
+
+# ── Parser ────────────────────────────────────────────────────────────────────
+
+def tokenize(body):
+    """Extract ordered ZMK binding tokens from a bindings block body."""
+    words = body.split()
+    tokens, i = [], 0
+    while i < len(words):
+        w = words[i]
+        if not w.startswith("&"):
+            i += 1
+            continue
+        b = w[1:]
+        if b in ("mt", "lt") and i + 2 < len(words):
+            tokens.append(f"&{b} {words[i+1]} {words[i+2]}"); i += 3
+        elif b in ("kp", "mmv", "msc", "mkp", "rgb_ug", "out") and i + 1 < len(words):
+            tokens.append(f"&{b} {words[i+1]}"); i += 2
+        elif b == "bt" and i + 1 < len(words):
+            if words[i+1] == "BT_SEL" and i + 2 < len(words):
+                tokens.append(f"&bt BT_SEL {words[i+2]}"); i += 3
+            else:
+                tokens.append(f"&bt {words[i+1]}"); i += 2
+        else:
+            tokens.append(w); i += 1
+    return tokens
+
+
+def parse(path):
+    """Return list of (name, [42 tokens]) from corne.keymap."""
+    with open(path) as f:
+        text = f.read()
+    text = re.sub(r"//[^\n]*", " ", text)   # strip line comments
+    layers = []
+    for m in re.finditer(
+        r'display-name\s*=\s*"([^"]+)"[^<]*<(.*?)>;', text, re.DOTALL
+    ):
+        layers.append((m.group(1), tokenize(m.group(2))))
+    return layers
+
+
+# ── Renderer ──────────────────────────────────────────────────────────────────
+# Corne key index → (grid_row, grid_col) in half-keyboard grid coords
+# Indices 0-5   = left  row 0,  6-11  = right row 0
+# Indices 12-17 = left  row 1, 18-23  = right row 1
+# Indices 24-29 = left  row 2, 30-35  = right row 2
+# Indices 36-38 = left  thumbs (offset +2), 39-41 = right thumbs (offset +1)
+
+IW = 6      # inner cell width (chars)
+CW = IW + 1 # cell step (shared border)
+GAP = 3     # char gap between halves
+
+# Palette indices
+C_BORDER = 1
+C_NORMAL = 2
+C_MOD    = 3   # yellow — modifier keys
+C_LAYER  = 4   # green  — layer-tap
+C_DIM    = 5   # dark   — empty / passthrough
+C_TITLE  = 6
+C_TAB    = 7
+
+
+def key_color(lbl):
+    if not lbl or lbl == "▽":      return C_DIM
+    if "[" in lbl:                  return C_LAYER
+    if any(c in lbl for c in "⌘⌥^⇧") or lbl in (
+        "LSFT","RSFT","LCTL","RCTL","LALT","RALT","LGUI","RGUI"
+    ):                              return C_MOD
+    return C_NORMAL
+
+
+def draw(stdscr, layers, cur):
+    stdscr.erase()
+    curses.curs_set(0)
+    H, W = stdscr.getmaxyx()
+
+    curses.init_pair(C_BORDER, curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_NORMAL, curses.COLOR_WHITE,   -1)
+    curses.init_pair(C_MOD,    curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_LAYER,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(C_DIM,    curses.COLOR_BLACK,   -1)
+    curses.init_pair(C_TITLE,  curses.COLOR_CYAN,    -1)
+    curses.init_pair(C_TAB,    curses.COLOR_MAGENTA, -1)
+
+    name, toks = layers[cur]
+
+    def put(r, c, s, pair, bold=False):
+        if r < 0 or r >= H or c < 0 or not s:
+            return
+        attr = curses.color_pair(pair) | (curses.A_BOLD if bold else 0)
+        try:
+            stdscr.addstr(r, c, s[:max(0, W - c)], attr)
+        except curses.error:
+            pass
+
+    # ── header ────────────────────────────────────────────────────────────────
+    put(0, 0,
+        f"  CORNE — {name}  ",
+        C_TITLE, bold=True)
+    put(0, 22,
+        "  [0-6] layer  [h/l ◀▶] prev/next  [q Esc] close",
+        C_TAB)
+
+    # ── keyboard grid ─────────────────────────────────────────────────────────
+    # char-space layout:
+    #   left half starts at col 0, right half starts at col (6*CW + 1 + GAP)
+    BASE_R = 2
+    LEFT_C  = 0
+    RIGHT_C = 6 * CW + 1 + GAP   # 6*7+1+3 = 46
+
+    def half_top(r, c):
+        """Draw top border of a 6-key row at char position (r,c)."""
+        s = "┌" + ("─" * IW + "┬") * 5 + "─" * IW + "┐"
+        put(r, c, s, C_BORDER)
+
+    def half_sep(r, c):
+        s = "├" + ("─" * IW + "┼") * 5 + "─" * IW + "┤"
+        put(r, c, s, C_BORDER)
+
+    def half_bot(r, c):
+        s = "└" + ("─" * IW + "┴") * 5 + "─" * IW + "┘"
+        put(r, c, s, C_BORDER)
+
+    def half_content(r, c, idx_start, n=6):
+        """Draw the content row for n keys starting at binding index idx_start."""
+        put(r, c, "│", C_BORDER)
+        for k in range(n):
+            idx = idx_start + k
+            lbl = label(toks[idx]) if idx < len(toks) else ""
+            col = key_color(lbl)
+            cell = lbl[:IW].center(IW)
+            put(r, c + 1 + k * CW, cell, col, bold=(col != C_DIM))
+            put(r, c + 1 + k * CW + IW, "│", C_BORDER)
+
+    # three main rows per half
+    for row_idx in range(3):
+        r_top  = BASE_R + row_idx * 2
+        r_cont = BASE_R + row_idx * 2 + 1
+        # left half
+        if row_idx == 0:
+            half_top(r_top, LEFT_C)
+        else:
+            half_sep(r_top, LEFT_C)
+        half_content(r_cont, LEFT_C, row_idx * 6)
+
+        # right half
+        if row_idx == 0:
+            half_top(r_top, RIGHT_C)
+        else:
+            half_sep(r_top, RIGHT_C)
+        half_content(r_cont, RIGHT_C, 6 + row_idx * 12)
+
+    # bottom border of main rows
+    bot_r = BASE_R + 3 * 2
+    half_bot(bot_r, LEFT_C)
+    half_bot(bot_r, RIGHT_C)
+
+    # ── thumb cluster ─────────────────────────────────────────────────────────
+    THUMB_R = bot_r + 1
+    # left thumbs start 2 cells in; right thumbs 1 cell in on right half
+    L_THUMB_C = LEFT_C  + 2 * CW
+    R_THUMB_C = RIGHT_C + 1 * CW
+
+    def thumb_half(r, c, idx_start):
+        put(r,   c, "┌" + ("─" * IW + "┬") * 2 + "─" * IW + "┐", C_BORDER)
+        put(r+1, c, "│", C_BORDER)
+        for k in range(3):
+            idx = idx_start + k
+            lbl = label(toks[idx]) if idx < len(toks) else ""
+            col = key_color(lbl)
+            cell = lbl[:IW].center(IW)
+            put(r+1, c + 1 + k * CW, cell, col, bold=(col != C_DIM))
+            put(r+1, c + 1 + k * CW + IW, "│", C_BORDER)
+        put(r+2, c, "└" + ("─" * IW + "┴") * 2 + "─" * IW + "┘", C_BORDER)
+
+    thumb_half(THUMB_R, L_THUMB_C, 36)
+    thumb_half(THUMB_R, R_THUMB_C, 39)
+
+    # ── layer tab bar ─────────────────────────────────────────────────────────
+    tab_r = THUMB_R + 3 + 1
+    tab_c = 0
+    for i, (lname, _) in enumerate(layers):
+        short = LAYER_SHORT.get(lname, lname[:4])
+        s = f" {i}:{short}"
+        if i == cur:
+            try:
+                stdscr.addstr(tab_r, tab_c, s,
+                    curses.color_pair(C_TITLE) | curses.A_BOLD | curses.A_REVERSE)
+            except curses.error:
+                pass
+        else:
+            put(tab_r, tab_c, s, C_TAB)
+        tab_c += len(s) + 1
+
+    stdscr.refresh()
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+def run(stdscr):
+    curses.use_default_colors()
+    curses.start_color()
+    stdscr.keypad(True)
+
+    try:
+        layers = parse(KEYMAP)
+    except Exception as e:
+        stdscr.addstr(0, 0, f"Error reading keymap: {e}")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    if not layers:
+        stdscr.addstr(0, 0, "No layers found in keymap.")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    cur = 0
+    while True:
+        draw(stdscr, layers, cur)
+        k = stdscr.getch()
+
+        if k in (ord("q"), ord("Q"), 27):           # q or Esc
+            break
+        elif ord("0") <= k <= ord("6"):
+            idx = k - ord("0")
+            if idx < len(layers):
+                cur = idx
+        elif k in (curses.KEY_RIGHT, ord("l")):
+            cur = (cur + 1) % len(layers)
+        elif k in (curses.KEY_LEFT, ord("h")):
+            cur = (cur - 1) % len(layers)
+        # KEY_RESIZE: just redraw on next iteration
+
+
+if __name__ == "__main__":
+    curses.wrapper(run)
